@@ -1,148 +1,109 @@
-const express = require("express"); const http = require("http"); const { Server } = require("socket.io"); const cors = require("cors");
+// larans-server.js (قسمت‌های اصلی برای اضافه شدن ویژگی پس لارانس و سوپر پس لارانس)
 
-const app = express(); app.use(cors()); const server = http.createServer(app); const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+const io = require("socket.io")(server);
 
-const PORT = process.env.PORT || 3000;
-
-let rooms = {};
-
-io.on("connection", (socket) => { console.log("کاربر متصل شد:", socket.id);
-
-socket.on("joinRoom", ({ roomCode, playerName }) => { if (!rooms[roomCode]) { rooms[roomCode] = { players: [], gameStarted: false, currentDealerIndex: 0, teamScores: [0, 0], dealerRotation: [0, 0, 0], roundNumber: 1 }; }
-
-const room = rooms[roomCode];
-if (room.players.length >= 6) return;
-
-const player = {
-  id: socket.id,
-  name: playerName,
-  hand: [],
-  bid: null,
-  team: room.players.length < 3 ? 0 : 1,
-  index: room.players.length
+let gameState = {
+  players: [],
+  teams: {
+    A: { score: 0, players: [] },
+    B: { score: 0, players: [] },
+  },
+  hakimTeam: "B",
+  hakimRoundCount: 6,
+  roundsWon: { A: 0, B: 0 },
+  candidatePlayerId: null,
+  candidateMode: null, // null | "post" | "super"
+  currentTrump: null,
+  gameMode: "normal", // normal | post | super
 };
 
-room.players.push(player);
-socket.join(roomCode);
-
-io.to(roomCode).emit("playerJoined", room.players.map(p => ({ name: p.name, team: p.team })));
-
-if (room.players.length === 6) {
-  startGame(roomCode);
-}
-
-});
-
-function startGame(roomCode) { const room = rooms[roomCode]; room.gameStarted = true; room.bids = []; room.deck = createDeck(); shuffle(room.deck);
-
-for (let i = 0; i < 6; i++) {
-  const player = room.players[i];
-  player.hand = room.deck.slice(i * 9, (i + 1) * 9);
-  io.to(player.id).emit("receiveCards", player.hand);
-}
-
-io.to(roomCode).emit("biddingStarted");
-
-}
-
-socket.on("submitBid", ({ roomCode, bid }) => { const room = rooms[roomCode]; const player = room.players.find(p => p.id === socket.id); if (!player || room.bids.find(b => b.playerId === player.id)) return;
-
-room.bids.push({ playerId: player.id, bid });
-if (room.bids.length === 6) {
-  resolveBids(roomCode);
-}
-
-});
-
-function resolveBids(roomCode) { const room = rooms[roomCode]; const validBids = room.bids.filter(b => b.bid !== "pass");
-
-if (validBids.length === 0) {
-  const dealer = room.players[room.currentDealerIndex];
-  const team = dealer.team;
-  room.teamScores[team] += 5;
-  room.roundNumber++;
-  return startGame(roomCode);
-}
-
-const highestBid = validBids.reduce((max, b) => b.bid > max.bid ? b : max);
-room.currentTurnIndex = room.players.find(p => p.id === highestBid.playerId).index;
-room.currentHand = [];
-room.leadingSuit = null;
-room.hokmSuit = null; // انتخاب بعدی توسط برنده مناقصه
-
-io.to(roomCode).emit("hokmSelect", highestBid.playerId);
-
-}
-
-socket.on("hokmSelected", ({ roomCode, suit }) => { const room = rooms[roomCode]; room.hokmSuit = suit; io.to(roomCode).emit("hokmSet", suit); io.to(roomCode).emit("startHand", room.currentTurnIndex); });
-
-socket.on("playCard", ({ roomCode, card }) => { const room = rooms[roomCode]; const player = room.players.find(p => p.id === socket.id); if (!player || !player.hand.includes(card)) return;
-
-player.hand = player.hand.filter(c => c !== card);
-room.currentHand.push({ playerId: player.id, card, index: player.index });
-
-if (room.currentHand.length === 1) {
-  room.leadingSuit = card.suit;
-}
-
-io.to(roomCode).emit("cardPlayed", { playerId: player.id, card });
-
-if (room.currentHand.length === 6) {
-  const winner = determineHandWinner(room);
-  io.to(roomCode).emit("handWinner", winner);
-  room.currentTurnIndex = winner.index;
-  room.currentHand = [];
-  room.leadingSuit = null;
-
-  if (room.players.every(p => p.hand.length === 0)) {
-    finishRound(roomCode);
-  } else {
-    io.to(roomCode).emit("startHand", winner.index);
+function determineCandidate(team) {
+  const candidates = gameState.teams[team].players.filter(p => p.selectedNumber !== undefined);
+  if (candidates.length === 0) {
+    const randomIndex = Math.floor(Math.random() * gameState.teams[team].players.length);
+    return gameState.teams[team].players[randomIndex].id;
   }
-} else {
-  room.currentTurnIndex = (room.currentTurnIndex + 1) % 6;
-  io.to(roomCode).emit("startHand", room.currentTurnIndex);
+  let max = -1, selected = null;
+  for (let player of candidates) {
+    if (player.selectedNumber > max) {
+      max = player.selectedNumber;
+      selected = player.id;
+    } else if (player.selectedNumber === max) {
+      // Tie: choose randomly
+      if (Math.random() < 0.5) selected = player.id;
+    }
+  }
+  return selected;
 }
 
-});
-
-function determineHandWinner(room) { const cards = room.currentHand; let best = cards[0]; for (let i = 1; i < cards.length; i++) { const current = cards[i]; best = compareCards(best, current, room); } return room.players.find(p => p.id === best.playerId); }
-
-function compareCards(a, b, room) { const priority = { "JOKER_WHITE": 3, "JOKER_BLACK": 2, }; if (a.card.type.startsWith("JOKER") || b.card.type.startsWith("JOKER")) { const aPower = priority[a.card.type] || 1; const bPower = priority[b.card.type] || 1; return aPower >= bPower ? a : b; }
-
-const isBHokm = b.card.suit === room.hokmSuit;
-const isAHokm = a.card.suit === room.hokmSuit;
-
-if (isBHokm && !isAHokm) return b;
-if (isAHokm && !isBHokm) return a;
-
-const isBLead = b.card.suit === room.leadingSuit;
-const isALead = a.card.suit === room.leadingSuit;
-
-if (isBLead && !isALead) return b;
-if (isALead && !isBLead) return a;
-
-return b.card.value > a.card.value ? b : a;
-
-}
-
-function finishRound(roomCode) { const room = rooms[roomCode]; // محاسبه امتیاز و تعیین تیم حاکم جدید و... room.roundNumber++; startGame(roomCode); }
-
-function createDeck() { const suits = ["hearts", "diamonds", "clubs", "spades"]; const values = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]; let deck = [];
-
-for (let suit of suits) {
-  for (let value of values) {
-    deck.push({ suit, value, type: "NORMAL" });
+function checkPostLaransCondition() {
+  const n = gameState.hakimRoundCount;
+  const m = gameState.roundsWon.A;
+  if (m + n > 9 && gameState.hakimTeam === "B") {
+    const candidate = determineCandidate("A");
+    gameState.candidatePlayerId = candidate;
+    io.to(candidate).emit("postLaransChoice", {
+      options: ["end", "post", "super"]
+    });
   }
 }
 
-deck.push({ type: "JOKER_BLACK" });
-deck.push({ type: "JOKER_WHITE" });
-return deck;
+io.on("connection", (socket) => {
+  // دریافت تصمیم بازیکن منتخب
+  socket.on("postLaransResponse", ({ choice }) => {
+    if (socket.id !== gameState.candidatePlayerId) return;
 
+    if (choice === "end") {
+      gameState.teams.A.score += gameState.hakimRoundCount * 2;
+      endHand();
+    } else if (choice === "post") {
+      gameState.gameMode = "post";
+      socket.emit("chooseTrump");
+    } else if (choice === "super") {
+      gameState.gameMode = "super";
+      continueHand();
+    }
+  });
+
+  // دریافت حکم جدید در پس لارانس
+  socket.on("newTrump", ({ trump }) => {
+    if (socket.id !== gameState.candidatePlayerId) return;
+    gameState.currentTrump = trump;
+    continueHand();
+  });
+});
+
+function evaluateEndOfRound() {
+  const A = gameState.roundsWon.A;
+  const B = gameState.roundsWon.B;
+  if (A + B >= 9) {
+    if (gameState.gameMode === "post" && A === 9) {
+      gameState.teams.A.score += 108;
+      endGame();
+    } else if (gameState.gameMode === "super" && A === 9) {
+      gameState.teams.A.score = Infinity;
+      endGame();
+    } else if (gameState.gameMode === "post" || gameState.gameMode === "super") {
+      gameState.teams.B.score += 18;
+      endHand();
+    } else {
+      endHand();
+    }
+  }
 }
 
-function shuffle(deck) { for (let i = deck.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [deck[i], deck[j]] = [deck[j], deck[i]]; } } });
+function endHand() {
+  // reset hand state
+  gameState.roundsWon = { A: 0, B: 0 };
+  gameState.candidatePlayerId = null;
+  gameState.gameMode = "normal";
+  // next hand setup ...
+}
 
-server.listen(PORT, () => console.log(Server running on port ${PORT}));
+function continueHand() {
+  // ادامه اجرای دست فعلی
+}
 
+function endGame() {
+  io.emit("gameOver", gameState.teams);
+}
